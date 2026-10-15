@@ -44,7 +44,7 @@ MODULES_CONF="/etc/modules-load.d/joeyblog-qdisc.conf"
 # 安全加固配置（Dirty Frag 风险面收敛）
 SECURITY_MODPROBE_CONF="/etc/modprobe.d/99-joeyblog-security.conf"
 # 脚本远程入口和本地快捷命令
-INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/install.sh"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/loticc/Actions-bbr-v3/my-custom/install.sh"
 QUICK_COMMAND_PATH="/usr/local/bin/b"
 # 可选：提升 GitHub API 限额（支持 GITHUB_TOKEN / GH_TOKEN）
 GITHUB_API_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
@@ -1118,7 +1118,7 @@ install_latest_version() {
     profile_label=$(get_profile_label "$profile")
 
     echo -e "\033[36m正在从 GitHub 获取 ${profile_label} 最新版本信息...\033[0m"
-    BASE_URL="https://api.github.com/repos/byJoey/Actions-bbr-v3/releases"
+    BASE_URL="https://api.github.com/repos/loticc/Actions-bbr-v3/releases"
     RELEASE_DATA=$(gh_api_get "$BASE_URL")
     if [[ -z "$RELEASE_DATA" ]]; then
         echo -e "\033[31m从 GitHub 获取版本信息失败。请检查网络连接或 API 状态。\033[0m"
@@ -1178,7 +1178,7 @@ install_specific_version() {
     assert_supported_kernel_install_system || return 1
     profile_label=$(get_profile_label "$profile")
 
-    BASE_URL="https://api.github.com/repos/byJoey/Actions-bbr-v3/releases"
+    BASE_URL="https://api.github.com/repos/loticc/Actions-bbr-v3/releases"
     RELEASE_DATA=$(gh_api_get "$BASE_URL")
     if [[ -z "$RELEASE_DATA" ]]; then
         echo -e "\033[31m从 GitHub 获取版本信息失败。请检查网络连接或 API 状态。\033[0m"
