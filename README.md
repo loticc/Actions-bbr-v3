@@ -5,7 +5,7 @@
 脚本入口：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/loticc/Actions-bbr-v3/my-custom/install.sh)
 ```
 
 首次运行后脚本会自动安装联网快捷命令，后续可直接运行：
@@ -87,7 +87,7 @@ linux-7.1.y -> patches/bbrv3-linux-7.1.patch
 ## 安装最新版
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/loticc/Actions-bbr-v3/my-custom/install.sh)
 ```
 
 首次运行后也可以直接输入：
@@ -118,7 +118,7 @@ b
 
 ```bash
 export GITHUB_TOKEN=你的 GitHub Token
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/loticc/Actions-bbr-v3/my-custom/install.sh)
 ```
 
 ## 指定版本安装
@@ -351,7 +351,7 @@ CVE-2026-31431 对应的 AEAD userspace 接口在新构建内核中由内核配�
 
 ```bash
 command -v python3 >/dev/null 2>&1 || (sudo apt update && sudo apt install -y python3)
-curl -fsSL -o cve_2026_31431_detector.py https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/cve_2026_31431_detector.py
+curl -fsSL -o cve_2026_31431_detector.py https://raw.githubusercontent.com/loticc/Actions-bbr-v3/my-custom/cve_2026_31431_detector.py
 chmod +x cve_2026_31431_detector.py
 sudo python3 cve_2026_31431_detector.py
 ```
