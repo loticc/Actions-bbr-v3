@@ -31,7 +31,16 @@ b
 
 不建议在树莓派、NanoPi 等依赖 U-Boot 或厂商定制内核链路的设备上使用。此类设备的内核安装和启动流程通常与通用 Debian/Ubuntu VPS 不一致。
 
-Debian testing/unstable 如果缺少 `VERSION_ID`，脚本会按 `VERSION_CODENAME` 识别 `bookworm`、`trixie`、`forky` 和 `sid`。Alpine Linux 暂不支持安装本项目内核包，因为当前 release 产物是 `.deb`，安装和引导流程依赖 Debian/Ubuntu 的包管理与内核安装链路。
+Debian testing/unstable 如果缺少 `VERSION_ID`，脚本会按 `VERSION_CODENAME` 识别 `bookworm`、`trixie`、`forky` 和 `sid`。
+
+| 系统 | 本项目内核安装 | 原因与边界 |
+| --- | --- | --- |
+| Debian 12+ / Ubuntu 24.04+ | 支持 `amd64` / `arm64` 的 `.deb` 包 | 需要能安装内核、生成 initramfs 并更新引导；云平台还要匹配磁盘和网卡驱动 |
+| Alpine Linux | 暂不支持 | 尚无原生 `.apk` 产物，也未接入 `mkinitfs` 和 Alpine 的引导更新流程 |
+| CentOS / CentOS Stream / Rocky / AlmaLinux | 暂不支持 | 尚无原生 `.rpm` 产物，也未接入 `dracut`、`kernel-install` 与 GRUB/BLS 流程 |
+| Docker / LXC / OpenVZ 等共享宿主内核的容器 | 不支持在容器内更换内核 | 必须在可控制内核与引导的宿主机上安装 |
+
+Alpine 与 CentOS 的支持请求分别跟踪于 [#32](https://github.com/byJoey/Actions-bbr-v3/issues/32) 和 [#40](https://github.com/byJoey/Actions-bbr-v3/issues/40)。它们需要原生打包、安装钩子和实际启动测试，不能通过安装 `dpkg` 或转换 `.deb` 包获得可靠支持。CentOS 7/8 已停止维护，也不能直接沿用本项目 Linux 7.x 的系统要求。
 
 本项目当前内核主线为 Linux 7.x。安装内核时脚本会按最低支持系统拦截过旧环境，避免因用户态、initramfs 或引导链路过旧导致启动失败或 kernel panic。推荐系统是更稳妥的部署选择；旧系统仍可使用状态检查、网络调优、清空优化和卸载功能。
 
@@ -52,6 +61,8 @@ Debian testing/unstable 如果缺少 `VERSION_ID`，脚本会按 `VERSION_CODENA
 10. BBR v3 智能带宽优化
 11. 清空网络优化配置
 12. BBR v3 疯批模式（极限测速挑战）
+13. 禁用 IPv6
+14. 恢复 IPv6
 ```
 
 常用流程：
@@ -80,9 +91,11 @@ BBRv3 补丁固定，内核自动跟随 kernel.org 最新 stable 更新。
 ```text
 linux-7.0.y -> patches/bbrv3-linux-7.0.patch
 linux-7.1.y -> patches/bbrv3-linux-7.1.patch
+linux-7.2.y -> patches/bbrv3-linux-7.2.patch
+linux-7.3.y -> patches/bbrv3-linux-7.3.patch
 ```
 
-同一个主线系列内的小版本更新会自动复用同一个 patch，例如 `7.0.11 -> 7.0.12`。如果内核跳到新的主线系列但仓库内还没有对应 patch，构建会直接失败，避免产出不可验证的内核包。
+同一个主线系列内的小版本更新会自动复用同一个 patch，例如 `7.2.10 -> 7.2.11`。如果新系列还没有对应 patch，脚本会尝试已有的最新补丁。精确应用失败时，会先试运行模糊匹配，确认能应用才继续；仍有冲突就停止构建。发生跨系列回退或模糊应用时，构建日志会提示维护者重新适配补丁。
 
 ## 安装最新版
 
@@ -111,7 +124,8 @@ b
 - 让用户选择标准 BBRv3 或 BBRv3 Max 激进吞吐内核。
 - 从 GitHub Releases 获取当前架构和内核类型匹配的最新版本。
 - 下载非 debug 的内核 `.deb` 包。
-- 安装新内核并更新引导配置。
+- 检查 DKMS、云平台驱动和启动文件，保留原有内核。
+- 安装新内核，验证 initramfs 并更新引导配置。
 - 提示是否重启。
 
 如果遇到 GitHub API rate limit，可先设置 token：
@@ -164,6 +178,21 @@ sysctl net.ipv4.tcp_congestion_control
 sysctl net.core.default_qdisc
 modinfo tcp_bbr 2>/dev/null | grep '^version:'
 ```
+
+## Debian 安装后显示 Ubuntu
+
+发行版和内核构建环境是两件事。安装本项目内核不会把 Debian 换成 Ubuntu。MobaXterm 等客户端可能根据内核构建信息判断系统；本项目在 Ubuntu 的 GitHub Actions 机器上编译，`/proc/version` 中可能出现 Ubuntu 的编译器版本。
+
+以系统自己的发行版信息为准：
+
+```bash
+cat /etc/os-release
+uname -r
+uname -v
+cat /proc/version
+```
+
+`/etc/os-release` 中的 `ID=debian` 表示当前用户态系统仍是 Debian；`uname -r` 显示正在运行的内核版本，`uname -v` 和 `/proc/version` 显示构建信息。客户端显示 Ubuntu 不代表安装错了系统，也不影响 BBRv3 的工作。编译器来源会如实保留，因此不能保证所有 SSH 客户端都按发行版识别。相关反馈见 [#38](https://github.com/byJoey/Actions-bbr-v3/issues/38)。
 
 ## 加速模式
 
@@ -320,7 +349,21 @@ net.ipv4.tcp_ecn = 0
 /etc/modules-load.d/joeyblog-qdisc.conf
 ```
 
-该功能只清空网络优化配置，不卸载 BBR 内核，也不移除 Dirty Frag 安全缓解规则。当前运行态参数可能需要重启后完全恢复为系统默认值。
+该功能只清空网络优化配置，不卸载 BBR 内核，也不移除 Dirty Frag 安全缓解规则或 IPv6 开关配置。当前运行态参数可能需要重启后完全恢复为系统默认值。
+
+## 禁用与恢复 IPv6
+
+菜单 `13` 会在确认后禁用当前接口和以后新建接口的 IPv6，配置独立保存到：
+
+```text
+/etc/sysctl.d/99-joeyblog-ipv6.conf
+```
+
+当前 SSH 连接使用 IPv6，或机器没有 IPv4 默认路由时，脚本会拒绝禁用，避免直接切断管理连接。需要 IPv6 的服务和客户端也会受影响，执行前请确认用途。
+
+首次禁用前，脚本会把 `all`、`default` 和当前各接口的 `disable_ipv6` 原值保存到 `/var/lib/joeyblog/ipv6-before-disable`，重复禁用不会覆盖这份快照。
+
+菜单 `14` 撤回本项目的 IPv6 配置，先恢复 `all`、`default`，再逐接口恢复原值，最后重新加载系统的其他 sysctl 规则。已消失的接口跳过，新接口沿用原来的 `default` 设置。原有或其他持久规则仍禁用 IPv6 的接口会单独列出，脚本不会删除那些规则。恢复失败时保留快照供重试，成功后删除。菜单 `11` 清空网络优化时会保留这个独立开关。
 
 ## 安全缓解
 
@@ -363,13 +406,52 @@ sudo python3 cve_2026_31431_detector.py
 构建流程会：
 
 - 读取 kernel.org 最新 stable 版本。
-- 下载 `gregkh/linux` 对应 stable 分支。
+- 从官方版本标签解析并固定源码提交，核对 Makefile 中的实际版本。
 - 应用仓库内固定 BBRv3 patch。
 - 强制默认启用 BBR 和 fq。
 - 关闭 debug info。
 - 拒绝发布 `*-dbg*.deb` / `*-dbgsym*.deb`。
 
-构建不会自动更新 BBR patch 本身。
+构建不会自动更新 BBR patch 本身，也不会把另一个版本的源码改成预期版本号发布。构建用户名与主机名固定为 `byjoey@actions-bbr-v3`；编译器版本保留真实来源。
+
+## 安装失败与云平台恢复
+
+### OCI ARM64：DKMS 模块编译失败
+
+[#37](https://github.com/byJoey/Actions-bbr-v3/issues/37) 中的实际失败项是第三方 `mimic/0.7.1` 的 DKMS 构建，随后 `/etc/kernel/postinst.d/dkms` 返回错误，导致新内核包停在 `half-configured`。这份日志不能证明 OCI ARM64 本身不受支持。
+
+出现 `dkms autoinstall ... failed` 时，先保留当前可启动内核，查看具体失败模块：
+
+```bash
+uname -r
+dkms status
+sudo dpkg --audit
+sudo tail -n 120 /var/lib/dkms/mimic/0.7.1/build/make.log
+```
+
+最后一条路径对应 Issue 中的版本；其他模块或版本以错误日志给出的路径为准。按日志更新模块或确认它支持目标内核；只有确认模块用途且不再需要它时，才考虑移除。不要为了让安装通过而直接删掉 DKMS 钩子或清空全部模块。
+
+安装脚本会提前拦截已注册的 `mimic/0.7.1`，防止再次进入这条已知失败流程。它不会自动移除模块，也不会绕过 DKMS 检查。其他第三方模块仍需核实与目标内核的兼容性。
+
+解决模块构建问题后，再执行 `sudo dpkg --configure -a`。只有包配置、initramfs 生成和引导更新全部成功，才重启。`kernel package ... is not supported` 可能来自 Ubuntu 的 DKMS 错误上报组件，根因仍要看模块自己的 `make.log`。
+
+### Azure：重启后无法连接
+
+[#39](https://github.com/byJoey/Actions-bbr-v3/issues/39) 的配置对比已指出旧构建缺少 Hyper-V 驱动，可能导致系统找不到根磁盘或网卡。SSH 防火墙放行无法修复这个启动阶段的问题。
+
+新构建会强制检查 Hyper-V 磁盘、网卡、PCI 和 NVMe 支持；安装脚本也会在识别到 Hyper-V 环境时检查下载包的驱动配置。缺少启动驱动就中止安装，不会继续提示重启。已经下载或安装的历史包不会因此自动修好，请使用修复后重新构建的产物。
+
+先通过 Azure 串行控制台、启动诊断或救援环境，在 GRUB 的高级选项中选择原来的发行版内核。进入系统后运行 `uname -r`，确认已经回到可用内核，再修复或卸载故障版本。没有控制台入口时，按云平台文档把系统盘挂载到救援虚拟机处理。
+
+可以查看目标内核的配置；下面命令检查的是当前运行内核，检查其他版本时替换文件名：
+
+```bash
+grep -E '^CONFIG_(HYPERV|HYPERV_STORAGE|HYPERV_NET|PCI_HYPERV|SCSI|BLK_DEV_SD|NVME_CORE|BLK_DEV_NVME)=' "/boot/config-$(uname -r)"
+```
+
+磁盘和网卡驱动必须可用。配置为 `y` 的驱动已编入内核，不会以 `.ko` 文件出现在 initramfs 中；配置为 `m` 的启动必需驱动则应被打进目标内核的 initramfs。不能仅凭 `lsinitramfs` 没找到模块就判断驱动缺失。
+
+安装新内核时保留发行版原有内核，确认新内核启动与联网正常后再清理。仅重启服务、调整安全组或重新部署同一故障内核，无法补齐缺失的驱动。
 
 ## 卸载
 

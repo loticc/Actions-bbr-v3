@@ -36,18 +36,12 @@ if ! [[ "$kernel_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-branch=$(echo "$kernel_version" | grep -oE '^[0-9]+\.[0-9]+')
+# 每次使用独立源码目录，保留以往构建现场，避免清理用户文件。
 mkdir -p "$workdir"
-
-if [[ ! -d "$workdir/linux/.git" ]]; then
-  git clone --depth=1 --branch "linux-$branch.y" \
-    https://github.com/gregkh/linux.git "$workdir/linux"
-fi
-
-cd "$workdir/linux"
-git fetch --depth=1 origin "linux-$branch.y"
-git reset --hard FETCH_HEAD
-git clean -fdx
+build_dir=$(mktemp -d "$workdir/build-${kernel_version}.XXXXXX")
+source_dir="$build_dir/linux"
+bash "$repo_root/scripts/kernel-source.sh" checkout "$kernel_version" "$source_dir"
+cd "$source_dir"
 
 bash "$repo_root/scripts/apply-bbrv3-port.sh"
 bash "$repo_root/scripts/apply-bbrv3-max-profile.sh"
@@ -56,14 +50,13 @@ grep -v "MODULE_DESCRIPTION" net/ipv4/tcp_bbr.c > net/ipv4/tcp_bbr.c.tmp
 mv net/ipv4/tcp_bbr.c.tmp net/ipv4/tcp_bbr.c
 echo 'MODULE_DESCRIPTION("TCP BBR v3 Max - aggressive throughput profile by Joey");' >> net/ipv4/tcp_bbr.c
 
-IFS='.' read -r v p s <<< "$kernel_version"
-sed -i "s/^VERSION *=.*/VERSION = $v/" Makefile
-sed -i "s/^PATCHLEVEL *=.*/PATCHLEVEL = $p/" Makefile
-sed -i "s/^SUBLEVEL *=.*/SUBLEVEL = $s/" Makefile
+export KBUILD_BUILD_USER=byjoey
+export KBUILD_BUILD_HOST=actions-bbr-v3
 
 export GITHUB_WORKSPACE="$repo_root"
 export KERNEL_VERSION="$kernel_version"
 bash "$repo_root/scripts/prepare-kernel-config.sh" "$config_arch"
+bash "$repo_root/scripts/prepare-kernel-packaging.sh"
 
 if [[ "$build_arch" == "arm64" ]]; then
   make ARCH=arm64 bindeb-pkg -j"$(nproc)" LOCALVERSION=-joeyblog-bbrv3-max KDEB_COMPRESS=gzip skipdbg=true
@@ -71,10 +64,10 @@ else
   make bindeb-pkg -j"$(nproc)" LOCALVERSION=-joeyblog-bbrv3-max KDEB_COMPRESS=gzip skipdbg=true
 fi
 
-if find "$workdir" -maxdepth 1 \( -name '*-dbg*.deb' -o -name '*-dbgsym*.deb' \) | grep -q .; then
+if find "$build_dir" -maxdepth 1 \( -name '*-dbg*.deb' -o -name '*-dbgsym*.deb' \) | grep -q .; then
   echo "ERROR: debug deb package was generated." >&2
-  find "$workdir" -maxdepth 1 \( -name '*-dbg*.deb' -o -name '*-dbgsym*.deb' \) -print >&2
+  find "$build_dir" -maxdepth 1 \( -name '*-dbg*.deb' -o -name '*-dbgsym*.deb' \) -print >&2
   exit 1
 fi
 
-find "$workdir" -maxdepth 1 -name 'linux-*.deb' -print | sort
+find "$build_dir" -maxdepth 1 -name 'linux-*.deb' -print | sort

@@ -41,6 +41,14 @@ CURRENT_QDISC=$(sysctl net.core.default_qdisc | awk '{print $3}')
 SYSCTL_CONF="/etc/sysctl.d/99-joeyblog.conf"
 # 模块自动加载配置文件路径
 MODULES_CONF="/etc/modules-load.d/joeyblog-qdisc.conf"
+# IPv6 开关使用独立文件，恢复时不改用户自己的 sysctl 配置
+IPV6_CONF="/etc/sysctl.d/99-joeyblog-ipv6.conf"
+IPV6_PROC_DIR="/proc/sys/net/ipv6/conf"
+IPV6_STATE_FILE="/var/lib/joeyblog/ipv6-before-disable"
+BOOT_DIR="/boot"
+BOOT_BACKUP_DIR="/var/backups/joeyblog-kernel"
+DKMS_STATE_DIR="/var/lib/dkms"
+DMI_VENDOR_FILE="/sys/class/dmi/id/sys_vendor"
 # 安全加固配置（Dirty Frag 风险面收敛）
 SECURITY_MODPROBE_CONF="/etc/modprobe.d/99-joeyblog-security.conf"
 # 脚本远程入口和本地快捷命令
@@ -104,6 +112,125 @@ version_ge() {
     local current="$1"
     local required="$2"
     [[ "$(printf '%s\n' "$required" "$current" | sort -V | head -n 1)" == "$required" ]]
+}
+
+# 当前 SSH 走 IPv6 时绝不直接断开连接；本地控制台也须有 IPv4 出口。
+assert_safe_ipv6_disable() {
+    local ssh_client="${SSH_CONNECTION:-}"
+    ssh_client="${ssh_client%% *}"
+    if [[ -z "$ssh_client" ]]; then
+        ssh_client="${SSH_CLIENT:-}"
+        ssh_client="${ssh_client%% *}"
+    fi
+    if [[ "$ssh_client" == *:* ]]; then
+        echo -e "\033[31m当前 SSH 连接使用 IPv6，禁用会立即断线。请改用 IPv4 SSH 或云控制台后重试。\033[0m"
+        return 1
+    fi
+    if ! command -v ip >/dev/null 2>&1 \
+        || ! ip -4 route show default 2>/dev/null | grep -q '^default'; then
+        echo -e "\033[31m未检测到 IPv4 默认路由，已拒绝禁用 IPv6，避免机器失联。\033[0m"
+        return 1
+    fi
+}
+
+validate_ipv6_snapshot() {
+    awk -F '\t' '
+        NF != 2 || $1 !~ /^[a-zA-Z0-9_.:-]+$/ || $2 !~ /^[01]$/ || seen[$1]++ {bad=1}
+        END {exit (bad || !seen["all"] || !seen["default"])}
+    '
+}
+
+save_ipv6_snapshot() {
+    local snapshot_file switch_file iface value
+    if sudo test -f "$IPV6_STATE_FILE"; then
+        sudo cat "$IPV6_STATE_FILE" | validate_ipv6_snapshot
+        return $?
+    fi
+    snapshot_file=$(mktemp) || return 1
+    for switch_file in "$IPV6_PROC_DIR"/*/disable_ipv6; do
+        [[ -f "$switch_file" ]] || continue
+        iface="${switch_file%/disable_ipv6}"
+        iface="${iface##*/}"
+        value=$(cat "$switch_file") || { rm -f "$snapshot_file"; return 1; }
+        printf '%s\t%s\n' "$iface" "$value" >> "$snapshot_file"
+    done
+    if ! validate_ipv6_snapshot < "$snapshot_file" \
+        || ! sudo install -d -m 700 "${IPV6_STATE_FILE%/*}" \
+        || ! sudo install -m 600 "$snapshot_file" "$IPV6_STATE_FILE"; then
+        rm -f "$snapshot_file"
+        echo -e "\033[31m无法保存原有 IPv6 设置，未执行禁用。\033[0m"
+        return 1
+    fi
+    rm -f "$snapshot_file"
+}
+
+disable_ipv6() {
+    local answer=""
+    assert_safe_ipv6_disable || return 1
+    if ! sysctl -n net.ipv6.conf.all.disable_ipv6 >/dev/null 2>&1; then
+        echo -e "\033[31m当前内核没有可用的 IPv6 开关。\033[0m"
+        return 1
+    fi
+    echo -e "\033[33m禁用后所有 IPv6 连接、监听和隧道都会中断；重启后仍保持禁用。\033[0m"
+    echo -n -e "\033[36m确认禁用 IPv6？输入 y 继续：\033[0m"
+    read -r answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || return 0
+    save_ipv6_snapshot || return 1
+
+    printf '%s\n' '# 由 Actions-bbr-v3 管理；使用菜单恢复 IPv6' \
+        'net.ipv6.conf.all.disable_ipv6 = 1' \
+        'net.ipv6.conf.default.disable_ipv6 = 1' \
+        | sudo tee "$IPV6_CONF" >/dev/null || return 1
+    if ! sudo sysctl -p "$IPV6_CONF"; then
+        echo -e "\033[31mIPv6 设置未全部应用，请检查上面的错误；配置文件位于 $IPV6_CONF。\033[0m"
+        return 1
+    fi
+    echo -e "\033[1;32mIPv6 已禁用。需要恢复时选择菜单 14。\033[0m"
+}
+
+restore_ipv6() {
+    local snapshot iface value switch_file default_value disabled=""
+    if ! sudo test -f "$IPV6_STATE_FILE"; then
+        if [[ -f "$IPV6_CONF" ]]; then
+            echo -e "\033[31m缺少禁用前的 IPv6 状态快照，无法安全还原逐接口设置，请先人工检查。\033[0m"
+            return 1
+        fi
+        echo -e "\033[33m没有本脚本写入的 IPv6 禁用配置。若系统自行禁用了 IPv6，请检查其他 sysctl 配置及 ipv6.disable=1 启动参数。\033[0m"
+        return 0
+    fi
+    snapshot=$(sudo cat "$IPV6_STATE_FILE") || return 1
+    if ! printf '%s\n' "$snapshot" | validate_ipv6_snapshot; then
+        echo -e "\033[31mIPv6 状态快照无效，未改动当前设置。\033[0m"
+        return 1
+    fi
+    sudo rm -f "$IPV6_CONF" || return 1
+    # all 会同时覆盖现有接口，必须先恢复它，再恢复各接口的原值。
+    for iface in all default; do
+        value=$(printf '%s\n' "$snapshot" | awk -F '\t' -v name="$iface" '$1 == name {print $2}')
+        printf '%s\n' "$value" | sudo tee "$IPV6_PROC_DIR/$iface/disable_ipv6" >/dev/null || return 1
+    done
+    default_value=$(printf '%s\n' "$snapshot" | awk -F '\t' '$1 == "default" {print $2}')
+    for switch_file in "$IPV6_PROC_DIR"/*/disable_ipv6; do
+        [[ -f "$switch_file" ]] || continue
+        iface="${switch_file%/disable_ipv6}"
+        iface="${iface##*/}"
+        [[ "$iface" == all || "$iface" == default ]] && continue
+        value=$(printf '%s\n' "$snapshot" | awk -F '\t' -v name="$iface" '$1 == name {print $2}')
+        printf '%s\n' "${value:-$default_value}" | sudo tee "$switch_file" >/dev/null || return 1
+    done
+    # 在原有运行态上重载持久规则，不删除管理员的其他配置。
+    sudo sysctl --system >/dev/null 2>&1 || true
+    sudo rm -f "$IPV6_STATE_FILE" || return 1
+    for switch_file in "$IPV6_PROC_DIR"/*/disable_ipv6; do
+        [[ -f "$switch_file" ]] || continue
+        if [[ "$(cat "$switch_file")" == 1 ]]; then
+            iface="${switch_file%/disable_ipv6}"
+            disabled="$disabled ${iface##*/}"
+        fi
+    done
+    echo -e "\033[1;32m已撤回本脚本的 IPv6 禁用，恢复禁用前设置并重新加载系统规则。\033[0m"
+    [[ -z "$disabled" ]] || echo -e "\033[33m以下开关仍禁用 IPv6（原有设置或其他持久规则）：$disabled\033[0m"
+    echo -e "\033[33m地址和默认路由可能需要网络服务重新配置或重启后恢复。\033[0m"
 }
 
 debian_version_from_codename() {
@@ -1050,7 +1177,168 @@ select_kernel_profile() {
     esac
 }
 
-# 函数：智能更新引导加载程序
+# 检查已知不兼容的 DKMS 模块，不能用跳过 postinst 的方式假装安装成功。
+assert_compatible_dkms() {
+    local status=""
+    if command -v dkms >/dev/null 2>&1; then
+        if ! status=$(sudo dkms status 2>&1); then
+            echo -e "\033[31m无法读取 DKMS 状态，已停止安装：\033[0m\n$status"
+            return 1
+        fi
+    fi
+    if printf '%s\n' "$status" | grep -Eq '^mimic(/|,[[:space:]]*)0\.7\.1([,/[:space:]]|$)'; then
+        echo -e "\033[31m检测到 mimic/0.7.1：已有在本项目 7.1.8 内核上 DKMS 编译失败的报告，尚未确认目标内核兼容，已保护性停止。\033[0m"
+        echo -e "\033[33m请先升级为已确认支持目标内核的 mimic，或继续使用发行版内核。本脚本不会删除该模块或跳过 DKMS。\033[0m"
+        echo -e "\033[33m已有失败的详细日志：$DKMS_STATE_DIR/mimic/0.7.1/build/make.log。\033[0m"
+        return 1
+    fi
+}
+
+is_hyperv_system() {
+    [[ -d /sys/bus/vmbus ]] \
+        || grep -qi 'Microsoft' "$DMI_VENDOR_FILE" 2>/dev/null \
+        || { command -v systemd-detect-virt >/dev/null 2>&1 \
+            && [[ "$(systemd-detect-virt 2>/dev/null)" == "microsoft" ]]; }
+}
+
+assert_cloud_kernel_config() {
+    local config_file="$1"
+    local symbol
+    is_hyperv_system || return 0
+    local symbols='HYPERV HYPERV_STORAGE HYPERV_NET PCI_HYPERV BLK_DEV_SD'
+    # 以目标配置识别独立 VMBus 开关，避免按内核版本猜测布局。
+    if grep -Eq '^(CONFIG_HYPERV_VMBUS=|# CONFIG_HYPERV_VMBUS is not set$)' "$config_file"; then
+        symbols="$symbols HYPERV_VMBUS"
+    fi
+    for symbol in $symbols; do
+        if ! grep -Eq "^CONFIG_${symbol}=[ym]$" "$config_file"; then
+            echo -e "\033[31m当前为 Hyper-V/Azure，目标内核缺少 CONFIG_${symbol}，重启可能无法挂载磁盘或联网。已拒绝安装。\033[0m"
+            return 1
+        fi
+    done
+}
+
+# 使用下载包的元数据识别内核，不信任标签或 /tmp 中的其他文件。
+validate_kernel_packages() {
+    local package_dir="$1"
+    local deb_file package_name package_arch image_file="" headers_found=0
+    local host_arch
+    host_arch=$(dpkg --print-architecture) || return 1
+    KERNEL_DEB_FILES=()
+    KERNEL_PACKAGE_RELEASE=""
+    for deb_file in "$package_dir"/*.deb; do
+        [[ -f "$deb_file" ]] || continue
+        if ! dpkg-deb -I "$deb_file" >/dev/null 2>&1; then
+            echo -e "\033[31m无法读取安装包：$deb_file；请检查下载是否完整及 dpkg 版本。\033[0m"
+            return 1
+        fi
+        package_name=$(dpkg-deb -f "$deb_file" Package) || return 1
+        package_arch=$(dpkg-deb -f "$deb_file" Architecture) || return 1
+        if [[ "$package_arch" != "$host_arch" ]]; then
+            echo -e "\033[31m安装包架构 $package_arch 与系统 $host_arch 不一致。\033[0m"
+            return 1
+        fi
+        case "$package_name" in
+            linux-image-*-joeyblog-bbrv3|linux-image-*-joeyblog-bbrv3-max)
+                [[ -z "$image_file" ]] || { echo '安装目录包含多个内核镜像，已停止。'; return 1; }
+                image_file="$deb_file"
+                KERNEL_PACKAGE_RELEASE="${package_name#linux-image-}"
+                ;;
+            linux-headers-*-joeyblog-bbrv3|linux-headers-*-joeyblog-bbrv3-max)
+                headers_found=$((headers_found + 1))
+                ;;
+            *) echo "拒绝安装不属于目标内核的包：$package_name"; return 1 ;;
+        esac
+        KERNEL_DEB_FILES+=("$deb_file")
+    done
+    if [[ -z "$image_file" || "$headers_found" -ne 1 ]]; then
+        echo -e "\033[31m必须完整下载一个内核镜像包和对应 headers 包。\033[0m"
+        return 1
+    fi
+    for deb_file in "${KERNEL_DEB_FILES[@]}"; do
+        package_name=$(dpkg-deb -f "$deb_file" Package) || return 1
+        if [[ "${package_name#linux-headers-}" != "$KERNEL_PACKAGE_RELEASE" \
+            && "${package_name#linux-image-}" != "$KERNEL_PACKAGE_RELEASE" ]]; then
+            echo '镜像与 headers 的内核版本不一致，已停止。'
+            return 1
+        fi
+    done
+    if ! (set -o pipefail; dpkg-deb --fsys-tarfile "$image_file" \
+        | tar -xOf - "./boot/config-$KERNEL_PACKAGE_RELEASE") > "$package_dir/kernel.config"; then
+        echo -e "\033[31m无法从内核包读取启动配置，已停止安装。\033[0m"
+        return 1
+    fi
+    assert_cloud_kernel_config "$package_dir/kernel.config"
+}
+
+backup_bootloader_state() {
+    local backup_dir="$1"
+    local name
+    sudo mkdir -p "$backup_dir" || return 1
+    for name in grub.cfg grubenv; do
+        if sudo test -f "$BOOT_DIR/grub/$name"; then
+            sudo cp -p "$BOOT_DIR/grub/$name" "$backup_dir/$name" || return 1
+        fi
+    done
+}
+
+restore_bootloader_state() {
+    local backup_dir="$1"
+    local name restored=0
+    for name in grub.cfg grubenv; do
+        if sudo test -f "$backup_dir/$name"; then
+            sudo cp -p "$backup_dir/$name" "$BOOT_DIR/grub/$name" || return 1
+            restored=1
+        fi
+    done
+    if [[ "$restored" == 1 ]]; then
+        echo -e "\033[33m已恢复安装前的 GRUB 配置，保留原有默认引导和旧内核。请先修复软件包状态，不要重启。\033[0m"
+    else
+        echo -e "\033[33m未找到可恢复的 GRUB 快照，请通过云控制台检查引导配置，暂勿重启。\033[0m"
+    fi
+}
+
+assert_kernel_boot_ready() {
+    local release="$1"
+    local config_file="$2"
+    local initrd_file="$BOOT_DIR/initrd.img-$release"
+    local symbol module module_list
+    if [[ "$(dpkg-query -W -f='${Status}' "linux-image-$release" 2>/dev/null)" != "install ok installed" ]] \
+        || [[ ! -s "$BOOT_DIR/vmlinuz-$release" || ! -s "$initrd_file" ]]; then
+        echo -e "\033[31m内核包未完成配置，或缺少内核镜像/initramfs，不能重启。\033[0m"
+        return 1
+    fi
+    is_hyperv_system || return 0
+    assert_cloud_kernel_config "$config_file" || return 1
+    if grep -Eq '^CONFIG_(HYPERV|HYPERV_VMBUS|HYPERV_STORAGE|HYPERV_NET|PCI_HYPERV|BLK_DEV_SD)=m$' "$config_file"; then
+        if ! command -v lsinitramfs >/dev/null 2>&1 \
+            || ! module_list=$(sudo lsinitramfs "$initrd_file"); then
+            echo -e "\033[31m无法检查 Azure 启动所需的 initramfs 驱动，已停止重启流程。\033[0m"
+            return 1
+        fi
+        for symbol in HYPERV HYPERV_VMBUS HYPERV_STORAGE HYPERV_NET PCI_HYPERV BLK_DEV_SD; do
+            grep -qx "CONFIG_${symbol}=m" "$config_file" || continue
+            case "$symbol" in
+                HYPERV)
+                    # 独立 VMBus 开关存在时，以它决定驱动是否为模块。
+                    grep -Eq '^CONFIG_HYPERV_VMBUS=[ym]$' "$config_file" && continue
+                    module='hv[-_]vmbus'
+                    ;;
+                HYPERV_VMBUS) module='hv[-_]vmbus' ;;
+                HYPERV_STORAGE) module='hv[-_]storvsc' ;;
+                HYPERV_NET) module='hv[-_]netvsc' ;;
+                PCI_HYPERV) module='pci[-_]hyperv' ;;
+                BLK_DEV_SD) module='sd[-_]mod' ;;
+            esac
+            if ! printf '%s\n' "$module_list" | grep -Eq "/${module}\.ko(\.(xz|gz|zst))?$"; then
+                echo -e "\033[31minitramfs 缺少 Azure 必需模块 ${module}，不能重启。\033[0m"
+                return 1
+            fi
+        done
+    fi
+}
+
+# 函数：更新已知的引导加载程序；未知引导链不能宣称可以安全重启。
 update_bootloader() {
     echo -e "\033[36m正在更新引导加载程序...\033[0m"
     if command -v update-grub &> /dev/null; then
@@ -1064,36 +1352,31 @@ update_bootloader() {
         fi
     else
         echo -e "\033[33m未找到 'update-grub'。您的系统可能使用 U-Boot 或其他引导程序。\033[0m"
-        echo -e "\033[33m在许多 ARM 系统上，内核安装包会自动处理引导更新，通常无需手动操作。\033[0m"
-        echo -e "\033[33m如果重启后新内核未生效，您可能需要手动更新引导配置，请参考您系统的文档。\033[0m"
-        return 0
+        echo -e "\033[33m软件包可能已运行自己的引导钩子，但本脚本无法确认当前引导链。请先在控制台核对引导配置，暂勿重启。\033[0m"
+        return 1
     fi
 }
 
 # 函数：安全地安装下载的包
 install_packages() {
-    if ! ls /tmp/linux-*.deb &> /dev/null; then
-        echo -e "\033[31m错误：未在 /tmp 目录下找到内核文件，安装中止。\033[0m"
+    local package_dir="$1"
+    local audit_output backup_dir
+    assert_compatible_dkms || return 1
+    audit_output=$(sudo dpkg --audit) || return 1
+    if [[ -n "$audit_output" ]]; then
+        echo -e "\033[31m系统已有未完成配置的软件包，请先修复；本次未安装新内核：\033[0m\n$audit_output"
         return 1
     fi
-
-    for deb_file in /tmp/linux-*.deb; do
-        if ! dpkg-deb -I "$deb_file" > /dev/null 2>&1; then
-            echo -e "\033[31m当前系统无法读取安装包：$deb_file\033[0m"
-            echo -e "\033[33m可能原因：dpkg 版本过旧，不支持该压缩格式。建议升级 dpkg 后重试。\033[0m"
-            return 1
-        fi
-    done
-    
-    echo -e "\033[36m开始卸载旧版内核... \033[0m"
-    INSTALLED_PACKAGES=$(dpkg -l | grep "joeyblog" | awk '{print $2}' | tr '\n' ' ')
-    if [[ -n "$INSTALLED_PACKAGES" ]]; then
-        sudo apt-get remove --purge $INSTALLED_PACKAGES -y > /dev/null 2>&1
-    fi
-
-    echo -e "\033[36m开始安装新内核... \033[0m"
-    if sudo dpkg -i /tmp/linux-*.deb && update_bootloader; then
-        echo -e "\033[1;32m内核安装并配置完成！\033[0m"
+    validate_kernel_packages "$package_dir" || return 1
+    sudo mkdir -p "$BOOT_BACKUP_DIR" || return 1
+    backup_dir=$(sudo mktemp -d "$BOOT_BACKUP_DIR/install.XXXXXX") || return 1
+    backup_bootloader_state "$backup_dir" || return 1
+    echo -e "\033[36m引导配置快照：$backup_dir\033[0m"
+    echo -e "\033[36m开始安装新内核；保留现有内核，供引导失败时回退...\033[0m"
+    if sudo dpkg -i "${KERNEL_DEB_FILES[@]}" \
+        && assert_kernel_boot_ready "$KERNEL_PACKAGE_RELEASE" "$package_dir/kernel.config" \
+        && update_bootloader; then
+        echo -e "\033[1;32m内核软件包和引导配置已完成；当前仍在运行 $(uname -r)，重启后才能验证新内核。\033[0m"
         echo -n -e "\033[33m需要重启系统来加载新内核。是否立即重启？ (y/n): \033[0m"
         read -r REBOOT_NOW
         if [[ "$REBOOT_NOW" == "y" || "$REBOOT_NOW" == "Y" ]]; then
@@ -1103,9 +1386,36 @@ install_packages() {
             echo -e "\033[33m操作完成。请记得稍后手动重启 ('sudo reboot') 来应用新内核。\033[0m"
         fi
     else
-        echo -e "\033[1;31m内核安装或引导更新失败！系统可能处于不稳定状态。请不要重启并寻求手动修复！\033[0m"
+        echo -e "\033[1;31m内核安装或引导验证失败。本次未完成，禁止直接重启。\033[0m"
+        restore_bootloader_state "$backup_dir" || echo '恢复 GRUB 快照失败，请立即通过控制台检查引导配置。'
+        echo -e "\033[33m请查看上面的 dpkg/DKMS 错误；不要用跳过 DKMS 的方式强行完成安装。\033[0m"
+        return 1
     fi
 }
+
+# 每次安装只使用本次下载的 image/headers，不替换发行版的 linux-libc-dev。
+download_and_install_release() (
+    local release_data="$1"
+    local tag="$2"
+    local package_dir asset_urls url
+    asset_urls=$(printf '%s\n' "$release_data" | jq -r --arg tag "$tag" '
+        .[] | select(.tag_name == $tag) | .assets[]
+        | select(.name | test("^linux-(image|headers)-.*\\.deb$"))
+        | select(.name | test("(-dbg_|-dbgsym_)"; "i") | not)
+        | .browser_download_url
+    ') || return 1
+    if [[ -z "$asset_urls" ]]; then
+        echo -e "\033[31m该版本没有可安装的内核包。\033[0m"
+        return 1
+    fi
+    package_dir=$(mktemp -d "${TMPDIR:-/tmp}/bbrv3.XXXXXX") || return 1
+    trap 'rm -rf "$package_dir"' EXIT
+    while IFS= read -r url; do
+        echo -e "\033[36m正在下载：$url\033[0m"
+        wget -q --show-progress "$url" -O "$package_dir/${url##*/}" || return 1
+    done <<< "$asset_urls"
+    install_packages "$package_dir"
+)
 
 # 函数：检查并安装最新版本
 install_latest_version() {
@@ -1154,19 +1464,7 @@ install_latest_version() {
     fi
 
     echo -e "\033[33m发现新版本或未安装内核，准备下载...\033[0m"
-    ASSET_URLS=$(echo "$RELEASE_DATA" | jq -r --arg tag "$LATEST_TAG_NAME" '
-      .[] | select(.tag_name == $tag) | .assets[].browser_download_url
-      | select(test("(-dbg_|-dbgsym_)"; "i") | not)
-    ')
-    
-    rm -f /tmp/linux-*.deb
-
-    for URL in $ASSET_URLS; do
-        echo -e "\033[36m正在下载文件：$URL\033[0m"
-        wget -q --show-progress "$URL" -P /tmp/ || { echo -e "\033[31m下载失败：$URL\033[0m"; return 1; }
-    done
-    
-    install_packages
+    download_and_install_release "$RELEASE_DATA" "$LATEST_TAG_NAME"
 }
 
 # 函数：安装指定版本
@@ -1218,19 +1516,7 @@ install_specific_version() {
     SELECTED_TAG="${TAG_ARRAY[$INDEX]}"
     echo -e "\033[36m已选择版本：\033[0m\033[1;32m$SELECTED_TAG\033[0m"
 
-    ASSET_URLS=$(echo "$RELEASE_DATA" | jq -r --arg tag "$SELECTED_TAG" '
-      .[] | select(.tag_name == $tag) | .assets[].browser_download_url
-      | select(test("(-dbg_|-dbgsym_)"; "i") | not)
-    ')
-    
-    rm -f /tmp/linux-*.deb
-    
-    for URL in $ASSET_URLS; do
-        echo -e "\033[36m下载中：$URL\033[0m"
-        wget -q --show-progress "$URL" -P /tmp/ || { echo -e "\033[31m下载失败：$URL\033[0m"; return 1; }
-    done
-
-    install_packages
+    download_and_install_release "$RELEASE_DATA" "$SELECTED_TAG"
 }
 
 # 美化输出的分隔线
@@ -1265,8 +1551,10 @@ echo -e "\033[33m 9. 🗑️  卸载 BBR 内核\033[0m"
 echo -e "\033[33m10. 🧠 BBR v3 智能带宽优化\033[0m"
 echo -e "\033[33m11. 🧹 清空网络优化配置\033[0m"
 echo -e "\033[33m12. 🧨 BBR v3 疯批模式（极限测速挑战）\033[0m"
+echo -e "\033[33m13. 禁用 IPv6（保留 IPv4）\033[0m"
+echo -e "\033[33m14. 恢复 IPv6\033[0m"
 print_separator
-echo -n -e "\033[36m请选择一个操作 (1-12) (｡･ω･｡): \033[0m"
+echo -n -e "\033[36m请选择一个操作 (1-14) (｡･ω･｡): \033[0m"
 read -r ACTION
 
 case "$ACTION" in
@@ -1371,7 +1659,13 @@ case "$ACTION" in
         echo -e "\033[1;32m(╯°□°）╯ 您选择了 BBR v3 疯批模式！\033[0m"
         apply_extreme_speedtest_tuning
         ;;
+    13)
+        disable_ipv6
+        ;;
+    14)
+        restore_ipv6
+        ;;
     *)
-        echo -e "\033[31m(￣▽￣)ゞ 无效的选项，请输入 1-12 之间的数字哦~\033[0m"
+        echo -e "\033[31m(￣▽￣)ゞ 无效的选项，请输入 1-14 之间的数字哦~\033[0m"
         ;;
 esac

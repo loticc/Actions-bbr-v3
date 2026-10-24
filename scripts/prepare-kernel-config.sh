@@ -3,6 +3,10 @@ set -euxo pipefail
 
 arch="${1:?usage: prepare-kernel-config.sh <x86_64|arm64>}"
 
+has_hyperv_vmbus() {
+  grep -qE '^config HYPERV_VMBUS([[:space:]]|$)' drivers/hv/Kconfig
+}
+
 run_olddefconfig() {
   if [ "$arch" = "arm64" ]; then
     timeout 300 make ARCH=arm64 olddefconfig < /dev/null
@@ -11,7 +15,34 @@ run_olddefconfig() {
   fi
 }
 
+apply_cloud_boot_config() {
+  local symbol
+
+  # 根盘和网卡直接内置，避免 Azure 因 initramfs 漏驱动而重启失联。
+  for symbol in ACPI SYSFS PCI PCI_MSI BLOCK SCSI SCSI_LOWLEVEL SCSI_FC_ATTRS \
+    BLK_DEV_SD NET NETDEVICES NET_CORE HYPERV HYPERV_STORAGE \
+    HYPERV_NET PCI_HYPERV PCI_HYPERV_INTERFACE NVME_CORE BLK_DEV_NVME; do
+    scripts/config --enable "$symbol"
+  done
+  # 旧源码把总线包含在 HYPERV 中，没有独立的 HYPERV_VMBUS 选项。
+  if has_hyperv_vmbus; then
+    scripts/config --enable HYPERV_VMBUS
+  fi
+
+  # SCSI_FC_ATTRS=m 会把 HYPERV_STORAGE=y 降为模块，必须随存储驱动一起内置。
+  # 普通 Azure 虚拟机运行在 VTL0，不能生成只能运行于 VTL2 的内核。
+  scripts/config --disable HYPERV_VTL_MODE
+  if [ "$arch" = x86_64 ]; then
+    scripts/config --enable HYPERVISOR_GUEST
+    scripts/config --enable X86_LOCAL_APIC
+  else
+    scripts/config --disable CPU_BIG_ENDIAN
+  fi
+}
+
 apply_policy_config() {
+  apply_cloud_boot_config
+
   scripts/config --disable SYSTEM_TRUSTED_KEYS
   scripts/config --disable SYSTEM_REVOCATION_KEYS
 
@@ -83,6 +114,23 @@ reject_enabled_config() {
 }
 
 validate_config() {
+  local symbol
+  for symbol in ACPI SYSFS PCI PCI_MSI BLOCK SCSI SCSI_LOWLEVEL SCSI_FC_ATTRS \
+    BLK_DEV_SD NET NETDEVICES NET_CORE HYPERV HYPERV_STORAGE \
+    HYPERV_NET PCI_HYPERV PCI_HYPERV_INTERFACE NVME_CORE BLK_DEV_NVME; do
+    require_config_line "CONFIG_${symbol}=y" "CONFIG_${symbol} 未内置；拒绝生成可能无法启动的云内核。"
+  done
+  if has_hyperv_vmbus; then
+    require_config_line 'CONFIG_HYPERV_VMBUS=y' 'CONFIG_HYPERV_VMBUS 未内置。'
+  fi
+  reject_enabled_config CONFIG_HYPERV_VTL_MODE
+  if [ "$arch" = x86_64 ]; then
+    require_config_line 'CONFIG_HYPERVISOR_GUEST=y' 'CONFIG_HYPERVISOR_GUEST 未启用。'
+    require_config_line 'CONFIG_X86_LOCAL_APIC=y' 'CONFIG_X86_LOCAL_APIC 未启用。'
+  else
+    reject_enabled_config CONFIG_CPU_BIG_ENDIAN
+  fi
+
   reject_enabled_config CONFIG_XFRM_ESP
   reject_enabled_config CONFIG_INET_ESP
   reject_enabled_config CONFIG_INET6_ESP

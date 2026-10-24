@@ -25,8 +25,18 @@ jobs:
     outputs:
       kernel_version: ${{ steps.plan.outputs.kernel_version }}
       raw_kernel_version: ${{ steps.plan.outputs.raw_kernel_version }}
+      kernel_commit: ${{ steps.plan.outputs.kernel_commit }}
       build_needed: ${{ steps.plan.outputs.build_needed }}
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 脚本回归检查
+        run: |
+          bash tests/test-kernel-source.sh
+          bash tests/test-installer.sh
+          bash tests/test-cloud-config.sh
+
       - name: 检查最新内核和已发布版本
         id: plan
         run: |
@@ -48,6 +58,8 @@ jobs:
             exit 1
           fi
 
+          kernel_commit=$(bash scripts/kernel-source.sh resolve "$version")
+          echo "kernel_commit=$kernel_commit" >> "$GITHUB_OUTPUT"
           echo "raw_kernel_version=$raw_version" >> "$GITHUB_OUTPUT"
           echo "kernel_version=$version" >> "$GITHUB_OUTPUT"
 
@@ -80,8 +92,8 @@ jobs:
       - name: 删除旧的工作流运行记录
         uses: Mattraks/delete-workflow-runs@main
         with:
-          retain_days: 0
-          keep_minimum_runs: 0
+          retain_days: 14
+          keep_minimum_runs: 10
 
   build:
     needs: [preflight, cleanup]
@@ -118,6 +130,8 @@ jobs:
     env:
       ARCH: ${{ matrix.arch }}
       KERNEL_VERSION: ${{ needs.preflight.outputs.kernel_version }}
+      KBUILD_BUILD_USER: byjoey
+      KBUILD_BUILD_HOST: actions-bbr-v3
     steps:
       - name: 检查是否已发布
         id: check_release
@@ -133,7 +147,7 @@ jobs:
 
       - name: 检出代码
         if: env.BUILD_NEEDED == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装依赖项
         if: env.BUILD_NEEDED == 'true'
@@ -154,9 +168,8 @@ jobs:
         if: env.BUILD_NEEDED == 'true'
         working-directory: ./kernel
         run: |
-          branch=$(echo "${{ env.KERNEL_VERSION }}" | grep -oP '^\d+\.\d+')
-          git clone --depth=1 --branch linux-$branch.y \
-            https://github.com/gregkh/linux.git linux
+          bash "$GITHUB_WORKSPACE/scripts/kernel-source.sh" checkout \
+            "$KERNEL_VERSION" linux "${{ needs.preflight.outputs.kernel_commit }}"
 
       - name: 应用 BBRv3 补丁
         if: env.BUILD_NEEDED == 'true'
@@ -186,15 +199,6 @@ jobs:
           
           tail -n 5 net/ipv4/tcp_bbr.c
 
-      - name: 更新 Makefile 中的版本号
-        if: env.BUILD_NEEDED == 'true'
-        working-directory: ./kernel/linux
-        run: |
-          IFS='.' read -r v p s <<< "${{ env.KERNEL_VERSION }}"
-          sed -i "s/^VERSION *=.*/VERSION = $v/" Makefile
-          sed -i "s/^PATCHLEVEL *=.*/PATCHLEVEL = $p/" Makefile
-          sed -i "s/^SUBLEVEL *=.*/SUBLEVEL = $s/" Makefile
-
       - name: 准备 .config 并禁用证书检查
         if: env.BUILD_NEEDED == 'true'
         timeout-minutes: 8
@@ -208,6 +212,16 @@ jobs:
         with:
           name: config-${{ matrix.arch }}-${{ matrix.profile }}-${{ env.KERNEL_VERSION }}
           path: ./build-configs/${{ matrix.arch }}*.config
+
+      - name: 编译 BBRv3 关键对象
+        if: env.BUILD_NEEDED == 'true'
+        working-directory: ./kernel/linux
+        run: make ARCH="$ARCH" -j"$(nproc)" net/ipv4/tcp_bbr.o
+
+      - name: 准备 DKMS headers 配置
+        if: env.BUILD_NEEDED == 'true'
+        working-directory: ./kernel/linux
+        run: bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-packaging.sh"
 
       - name: 构建内核 Debian 包
         if: env.BUILD_NEEDED == 'true'
@@ -228,6 +242,14 @@ jobs:
             exit 1
           fi
           find ./kernel -maxdepth 1 -name 'linux-*.deb' -print | sort
+          headers_dir=$(mktemp -d)
+          headers_deb=$(find ./kernel -maxdepth 1 -name 'linux-headers-*.deb' -print -quit)
+          test -n "$headers_deb"
+          dpkg-deb --extract "$headers_deb" "$headers_dir"
+          headers_config=$(find "$headers_dir/usr/src" -mindepth 2 -maxdepth 2 -name .config -print -quit)
+          test -n "$headers_config"
+          cmp ./kernel/linux/.config "$headers_config"
+          rm -rf "$headers_dir"
 
       - name: 发布前复查是否已发布
         if: env.BUILD_NEEDED == 'true'
@@ -273,7 +295,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 下载本轮最终配置
         uses: actions/download-artifact@v4
